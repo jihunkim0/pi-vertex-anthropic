@@ -712,7 +712,7 @@ export default function (pi: ExtensionAPI) {
 	// Register provider with OAuth-style /login support
 	pi.registerProvider("vertex-anthropic", {
 		baseUrl: `https://${endpoint}`,
-		api: "vertex-anthropic-api",
+		api: "anthropic-messages",
 
 		// OAuth configuration for /login command
 		oauth: {
