@@ -512,17 +512,42 @@ function streamVertexAnthropic(
 
 			// Handle thinking/reasoning
 			if (options?.reasoning && model.reasoning) {
-				const defaultBudgets: Record<string, number> = {
-					minimal: 1024,
-					low: 4096,
-					medium: 10240,
-					high: 20480,
-				};
+				const isAdaptiveSupported = model.id.includes("-4-6") || model.id.includes("-3-7") || model.id.includes("-4-5"); // Assume newer models support adaptive
+				const isOpus46 = model.id.includes("opus-4-6");
+
 				const customBudget = options.thinkingBudgets?.[options.reasoning as keyof typeof options.thinkingBudgets];
-				body.thinking = {
-					type: "enabled",
-					budget_tokens: customBudget ?? defaultBudgets[options.reasoning] ?? 10240,
-				};
+
+				// Provide plenty of max_tokens for xhigh
+				if (options.reasoning === "xhigh") {
+					body.max_tokens = Math.max(body.max_tokens, 64000);
+				}
+
+				if (customBudget) {
+					body.thinking = { type: "enabled", budget_tokens: customBudget };
+					body.max_tokens = Math.max(body.max_tokens, customBudget + 1000);
+				} else if (isAdaptiveSupported) {
+					// Use Adaptive Thinking for newer models
+					let effort = "high";
+					if (options.reasoning === "xhigh") effort = "max";
+					else if (options.reasoning === "high") effort = "high";
+					else if (options.reasoning === "medium") effort = "medium";
+					else if (options.reasoning === "low" || options.reasoning === "minimal") effort = "low";
+
+					body.thinking = { type: "adaptive" };
+					body.output_config = { effort };
+				} else {
+					// Fallback to manual budgeting for older models
+					const defaultBudgets: Record<string, number> = {
+						minimal: 1024,
+						low: 4096,
+						medium: 10240,
+						high: 20480,
+						xhigh: 40000,
+					};
+					const budget = defaultBudgets[options.reasoning] ?? 10240;
+					body.thinking = { type: "enabled", budget_tokens: budget };
+					body.max_tokens = Math.max(body.max_tokens, budget + 1000);
+				}
 			}
 
 			// Make request to Vertex AI streamRawPredict endpoint
