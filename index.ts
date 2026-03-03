@@ -24,10 +24,86 @@ import {
 	type ToolResultMessage,
 } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { execSync } from "node:child_process";
+import { execFileSync, execFile as execFileCb } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFileCb);
 
 // =============================================================================
-// Configuration
+// Typed Anthropic API message structures
+// =============================================================================
+
+interface AnthropicTextBlock {
+	type: "text";
+	text: string;
+	cache_control?: { type: "ephemeral" };
+}
+
+interface AnthropicThinkingBlock {
+	type: "thinking";
+	thinking: string;
+	signature: string;
+}
+
+interface AnthropicToolUseBlock {
+	type: "tool_use";
+	id: string;
+	name: string;
+	input: Record<string, unknown>;
+}
+
+interface AnthropicToolResultBlock {
+	type: "tool_result";
+	tool_use_id: string;
+	content: string | AnthropicContentBlock[];
+	is_error?: boolean;
+	cache_control?: { type: "ephemeral" };
+}
+
+interface AnthropicImageBlock {
+	type: "image";
+	source: { type: "base64"; media_type: string; data: string };
+}
+
+type AnthropicContentBlock =
+	| AnthropicTextBlock
+	| AnthropicThinkingBlock
+	| AnthropicToolUseBlock
+	| AnthropicToolResultBlock
+	| AnthropicImageBlock;
+
+interface AnthropicMessage {
+	role: "user" | "assistant";
+	content: string | AnthropicContentBlock[];
+}
+
+// =============================================================================
+// Input Validation
+// =============================================================================
+
+/** Validate GCP project ID format. Accepts standard and org-prefixed formats. */
+function validateProjectId(project: string): string {
+	const sanitized = project.trim();
+	// GCP project IDs: lowercase letters, digits, hyphens, 6-30 chars
+	// Also allow org-prefixed: google.com:my-project
+	if (!sanitized || !/^[a-z][a-z0-9.:_-]{3,48}[a-z0-9]$/i.test(sanitized)) {
+		throw new Error(`Invalid GCP project ID format: "${sanitized}"`);
+	}
+	return sanitized;
+}
+
+/** Validate GCP region format. */
+function validateRegion(region: string): string {
+	const sanitized = region.trim();
+	if (!sanitized || !/^(?:global|[a-z]+-[a-z]+\d+(-[a-z])?)$/.test(sanitized)) {
+		throw new Error(`Invalid GCP region format: "${sanitized}"`);
+	}
+	return sanitized;
+}
+
+// =============================================================================
+// Configuration (lazy evaluation)
 // =============================================================================
 
 /**
@@ -40,7 +116,7 @@ import { execSync } from "node:child_process";
 function getPersistedCredentials(): { project?: string; region?: string } {
 	try {
 		const authPath = `${process.env.HOME}/.pi/agent/auth.json`;
-		const data = JSON.parse(require("fs").readFileSync(authPath, "utf-8"));
+		const data = JSON.parse(readFileSync(authPath, "utf-8"));
 		const cred = data["vertex-anthropic"];
 		if (cred?.type === "oauth") {
 			return {
@@ -52,32 +128,71 @@ function getPersistedCredentials(): { project?: string; region?: string } {
 	return {};
 }
 
+/** Cached gcloud path — discovered lazily on first use. */
+let cachedGcloudPath: string | null = null;
+
+function findGcloud(): string {
+	if (cachedGcloudPath) return cachedGcloudPath;
+
+	const paths = [
+		"/usr/local/bin/gcloud",
+		"/usr/bin/gcloud",
+		`${process.env.HOME}/google-cloud-sdk/bin/gcloud`,
+		"gcloud",
+	];
+
+	for (const p of paths) {
+		try {
+			execFileSync(p, ["version"], { stdio: "ignore", timeout: 2000 });
+			cachedGcloudPath = p;
+			return p;
+		} catch {}
+	}
+
+	cachedGcloudPath = "gcloud";
+	return "gcloud";
+}
+
 function getConfig() {
 	const persisted = getPersistedCredentials();
 	return {
 		project: process.env.VERTEX_PROJECT_ID || persisted.project || "your-gcp-project-id",
 		region: process.env.VERTEX_REGION || persisted.region || "us-east5",
-		gcloudPath: process.env.VERTEX_GCLOUD_PATH || findGcloud(),
+		get gcloudPath() {
+			return process.env.VERTEX_GCLOUD_PATH || findGcloud();
+		},
 	};
 }
 
-function findGcloud(): string {
-	// Try common locations
-	const paths = [
-		"/usr/local/bin/gcloud",
-		"/usr/bin/gcloud",
-		`${process.env.HOME}/google-cloud-sdk/bin/gcloud`,
-		"gcloud", // Let OS find it
-	];
+// =============================================================================
+// Token Caching (async, non-blocking)
+// =============================================================================
 
-	for (const path of paths) {
-		try {
-			execSync(`${path} version`, { stdio: "ignore", timeout: 1000 });
-			return path;
-		} catch {}
+let tokenCache: { token: string; expiresAt: number } | null = null;
+
+/** Get a gcloud access token, using cache when possible. Non-blocking. */
+async function getAccessToken(gcloudPath: string): Promise<string> {
+	if (tokenCache && Date.now() < tokenCache.expiresAt) {
+		return tokenCache.token;
 	}
 
-	return "gcloud"; // Fallback
+	const { stdout } = await execFileAsync(gcloudPath, ["auth", "print-access-token"], {
+		timeout: 10000,
+	});
+	const token = stdout.trim();
+
+	if (!token || token.length < 20) {
+		throw new Error("Invalid access token from gcloud. Run: gcloud auth login");
+	}
+
+	// gcloud tokens last ~60 min; cache for 50 min to avoid edge-case expiry
+	tokenCache = { token, expiresAt: Date.now() + 50 * 60 * 1000 };
+	return token;
+}
+
+/** Invalidate the cached token (e.g., on 401). */
+function invalidateTokenCache(): void {
+	tokenCache = null;
 }
 
 // =============================================================================
@@ -92,19 +207,18 @@ function findGcloud(): string {
 function transformMessages(
 	messages: Message[],
 	model: Model<Api>,
-	normalizeToolCallId?: (id: string) => string,
+	normalizeToolCallIdFn?: (id: string) => string,
 ): Message[] {
 	// Build a map of original tool call IDs to normalized IDs
 	const toolCallIdMap = new Map<string, string>();
 
 	// First pass: transform messages (thinking blocks, tool call ID normalization)
 	const transformed = messages.map((msg) => {
-		// User messages pass through unchanged
 		if (msg.role === "user") {
 			return msg;
 		}
 
-		// Handle toolResult messages - normalize toolCallId if we have a mapping
+		// Handle toolResult messages — normalize toolCallId if we have a mapping
 		if (msg.role === "toolResult") {
 			const normalizedId = toolCallIdMap.get(msg.toolCallId);
 			if (normalizedId && normalizedId !== msg.toolCallId) {
@@ -121,69 +235,52 @@ function transformMessages(
 				assistantMsg.api === model.api &&
 				assistantMsg.model === model.id;
 
-			const transformedContent = assistantMsg.content.flatMap((block) => {
+			const transformedContent = assistantMsg.content.flatMap((block): (TextContent | ThinkingContent | ToolCall)[] => {
 				if (block.type === "thinking") {
 					const thinkingBlock = block as ThinkingContent;
-					// For same model: keep thinking blocks with signatures (needed for replay)
-					if (isSameModel && thinkingBlock.thinkingSignature) return block;
-
-					// Skip empty thinking blocks, convert others to plain text
+					if (isSameModel && thinkingBlock.thinkingSignature) return [thinkingBlock];
 					if (!thinkingBlock.thinking || thinkingBlock.thinking.trim() === "") return [];
-					if (isSameModel) return block;
-
-					return {
-						type: "text" as const,
-						text: thinkingBlock.thinking,
-					};
+					if (isSameModel) return [thinkingBlock];
+					return [{ type: "text" as const, text: thinkingBlock.thinking } as TextContent];
 				}
 
 				if (block.type === "text") {
-					if (isSameModel) return block;
-					return {
-						type: "text" as const,
-						text: block.text,
-					};
+					if (isSameModel) return [block as TextContent];
+					return [{ type: "text" as const, text: block.text } as TextContent];
 				}
 
 				if (block.type === "toolCall") {
 					const toolCall = block as ToolCall;
-					let normalizedToolCall = toolCall;
-
-					if (!isSameModel && normalizeToolCallId) {
-						const normalizedId = normalizeToolCallId(toolCall.id);
+					if (!isSameModel && normalizeToolCallIdFn) {
+						const normalizedId = normalizeToolCallIdFn(toolCall.id);
 						if (normalizedId !== toolCall.id) {
 							toolCallIdMap.set(toolCall.id, normalizedId);
-							normalizedToolCall = { ...normalizedToolCall, id: normalizedId };
+							return [{ ...toolCall, id: normalizedId }];
 						}
 					}
-
-					return normalizedToolCall;
+					return [toolCall];
 				}
 
-				return block;
+				return [block];
 			});
 
-			return {
-				...assistantMsg,
-				content: transformedContent,
-			};
+			return { ...assistantMsg, content: transformedContent } as AssistantMessage;
 		}
 
 		return msg;
 	});
 
 	// Second pass: insert synthetic empty tool results for orphaned tool calls
-	// This preserves thinking signatures and satisfies API requirements
 	const result: Message[] = [];
 	let pendingToolCalls: ToolCall[] = [];
 	let existingToolResultIds = new Set<string>();
-	let skippedToolCallIds = new Set<string>();
+	const skippedToolCallIds = new Set<string>();
 
 	for (let i = 0; i < transformed.length; i++) {
 		const msg = transformed[i];
 
 		if (msg.role === "assistant") {
-			// If we have pending orphaned tool calls from a previous assistant, insert synthetic results now
+			// Insert synthetic results for any orphaned tool calls from previous assistant
 			if (pendingToolCalls.length > 0) {
 				for (const tc of pendingToolCalls) {
 					if (!existingToolResultIds.has(tc.id)) {
@@ -197,28 +294,26 @@ function transformMessages(
 						} as ToolResultMessage);
 					}
 				}
-				pendingToolCalls = [];
-				existingToolResultIds = new Set();
 			}
 
-			// Skip errored/aborted assistant messages entirely.
-			// These are incomplete turns that shouldn't be replayed.
-			// Also track their tool call IDs so we can drop the corresponding tool results.
 			const assistantMsg = msg as AssistantMessage;
+
+			// Skip errored/aborted assistant messages entirely
 			if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
 				const toolCalls = assistantMsg.content.filter((b) => b.type === "toolCall") as ToolCall[];
 				for (const tc of toolCalls) {
 					skippedToolCallIds.add(tc.id);
 				}
+				// Reset pending state since we're skipping this message
+				pendingToolCalls = [];
+				existingToolResultIds = new Set();
 				continue;
 			}
 
-			// Track tool calls from this assistant message
+			// Always reset pending state for each new (non-errored) assistant message
 			const toolCalls = assistantMsg.content.filter((b) => b.type === "toolCall") as ToolCall[];
-			if (toolCalls.length > 0) {
-				pendingToolCalls = toolCalls;
-				existingToolResultIds = new Set();
-			}
+			pendingToolCalls = toolCalls;
+			existingToolResultIds = new Set();
 
 			result.push(msg);
 		} else if (msg.role === "toolResult") {
@@ -230,7 +325,7 @@ function transformMessages(
 			existingToolResultIds.add(toolResultMsg.toolCallId);
 			result.push(msg);
 		} else if (msg.role === "user") {
-			// User message interrupts tool flow - insert synthetic results for orphaned calls
+			// User message interrupts tool flow — insert synthetic results for orphaned calls
 			if (pendingToolCalls.length > 0) {
 				for (const tc of pendingToolCalls) {
 					if (!existingToolResultIds.has(tc.id)) {
@@ -257,7 +352,7 @@ function transformMessages(
 }
 
 // =============================================================================
-// Message conversion (from custom-provider-anthropic example)
+// Message conversion
 // =============================================================================
 
 function sanitizeSurrogates(text: string): string {
@@ -266,13 +361,13 @@ function sanitizeSurrogates(text: string): string {
 
 function convertContentBlocks(
 	content: (TextContent | ImageContent)[],
-): string | Array<{ type: "text"; text: string } | { type: "image"; source: any }> {
+): string | Array<AnthropicTextBlock | AnthropicImageBlock> {
 	const hasImages = content.some((c) => c.type === "image");
 	if (!hasImages) {
 		return sanitizeSurrogates(content.map((c) => (c as TextContent).text).join("\n"));
 	}
 
-	const blocks = content.map((block) => {
+	const blocks: Array<AnthropicTextBlock | AnthropicImageBlock> = content.map((block) => {
 		if (block.type === "text") {
 			return { type: "text" as const, text: sanitizeSurrogates(block.text) };
 		}
@@ -293,16 +388,14 @@ function convertContentBlocks(
 	return blocks;
 }
 
-// Normalize tool call IDs to match Anthropic's required pattern and length
+/** Normalize tool call IDs to match Anthropic's required pattern and length. */
 function normalizeToolCallId(id: string): string {
 	return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
 }
 
-function convertMessages(messages: Message[], model: Model<Api>, _tools?: Tool[]): any[] {
-	const params: any[] = [];
+function convertMessages(messages: Message[], model: Model<Api>, _tools?: Tool[]): AnthropicMessage[] {
+	const params: AnthropicMessage[] = [];
 
-	// Transform messages for cross-provider compatibility - this removes errored/aborted
-	// assistant messages and inserts synthetic tool results for orphaned tool calls
 	const transformedMessages = transformMessages(messages, model, normalizeToolCallId);
 
 	for (let i = 0; i < transformedMessages.length; i++) {
@@ -314,12 +407,12 @@ function convertMessages(messages: Message[], model: Model<Api>, _tools?: Tool[]
 					params.push({ role: "user", content: sanitizeSurrogates(msg.content) });
 				}
 			} else {
-				const blocks: any[] = msg.content.map((item) =>
+				const blocks: AnthropicContentBlock[] = msg.content.map((item) =>
 					item.type === "text"
 						? { type: "text" as const, text: sanitizeSurrogates(item.text) }
 						: {
 								type: "image" as const,
-								source: { type: "base64" as const, media_type: item.mimeType as any, data: item.data },
+								source: { type: "base64" as const, media_type: item.mimeType, data: item.data },
 							},
 				);
 				if (blocks.length > 0) {
@@ -327,14 +420,14 @@ function convertMessages(messages: Message[], model: Model<Api>, _tools?: Tool[]
 				}
 			}
 		} else if (msg.role === "assistant") {
-			const blocks: any[] = [];
+			const blocks: AnthropicContentBlock[] = [];
 			for (const block of msg.content) {
 				if (block.type === "text" && block.text.trim()) {
 					blocks.push({ type: "text", text: sanitizeSurrogates(block.text) });
 				} else if (block.type === "thinking" && block.thinking.trim()) {
 					if ((block as ThinkingContent).thinkingSignature) {
 						blocks.push({
-							type: "thinking" as any,
+							type: "thinking",
 							thinking: sanitizeSurrogates(block.thinking),
 							signature: (block as ThinkingContent).thinkingSignature!,
 						});
@@ -346,7 +439,7 @@ function convertMessages(messages: Message[], model: Model<Api>, _tools?: Tool[]
 						type: "tool_use",
 						id: block.id,
 						name: block.name,
-						input: block.arguments,
+						input: block.arguments as Record<string, unknown>,
 					});
 				}
 			}
@@ -354,7 +447,7 @@ function convertMessages(messages: Message[], model: Model<Api>, _tools?: Tool[]
 				params.push({ role: "assistant", content: blocks });
 			}
 		} else if (msg.role === "toolResult") {
-			const toolResults: any[] = [];
+			const toolResults: AnthropicToolResultBlock[] = [];
 			toolResults.push({
 				type: "tool_result",
 				tool_use_id: msg.toolCallId,
@@ -378,109 +471,125 @@ function convertMessages(messages: Message[], model: Model<Api>, _tools?: Tool[]
 		}
 	}
 
-	// Validation pass: ensure every tool_result references a tool_use in the
-	// immediately preceding assistant message. This handles edge cases where:
-	// - An assistant message was dropped (empty content after filtering)
-	// - Tool results reference tool_use IDs from a different/skipped assistant turn
-	// - Messages got reordered or corrupted
-	const validated: any[] = [];
-	for (let i = 0; i < params.length; i++) {
-		const msg = params[i];
+	// -------------------------------------------------------------------------
+	// Validation pass 1: ensure every tool_result references a tool_use in the
+	// immediately preceding assistant message.
+	// -------------------------------------------------------------------------
+	const validated: AnthropicMessage[] = [];
+	for (const msg of params) {
+		if (
+			msg.role === "user" &&
+			Array.isArray(msg.content) &&
+			(msg.content as AnthropicContentBlock[]).some((b) => b.type === "tool_result")
+		) {
+			const prevAssistant =
+				validated.length > 0 && validated[validated.length - 1].role === "assistant"
+					? validated[validated.length - 1]
+					: null;
 
-		if (msg.role === "user" && Array.isArray(msg.content) && msg.content.some((b: any) => b.type === "tool_result")) {
-			// Find the immediately preceding assistant message in validated output
-			const prevAssistant = validated.length > 0 && validated[validated.length - 1].role === "assistant"
-				? validated[validated.length - 1]
-				: null;
-
-			// Collect tool_use IDs from the preceding assistant message
 			const validToolUseIds = new Set<string>();
 			if (prevAssistant && Array.isArray(prevAssistant.content)) {
-				for (const block of prevAssistant.content) {
+				for (const block of prevAssistant.content as AnthropicContentBlock[]) {
 					if (block.type === "tool_use") {
 						validToolUseIds.add(block.id);
 					}
 				}
 			}
 
-			// Filter tool_results to only those with a matching tool_use in the preceding assistant
-			const filteredContent = msg.content.filter((block: any) => {
+			const filteredContent = (msg.content as AnthropicContentBlock[]).filter((block) => {
 				if (block.type === "tool_result") {
 					return validToolUseIds.has(block.tool_use_id);
 				}
-				return true; // Keep non-tool_result blocks
+				return true;
 			});
 
 			if (filteredContent.length > 0) {
 				validated.push({ ...msg, content: filteredContent });
 			}
-			// If all tool_results were orphaned, drop the entire user message
 		} else {
 			validated.push(msg);
 		}
 	}
 
-	// Reverse validation: ensure every tool_use in an assistant message has a
-	// corresponding tool_result in the immediately following user message.
-	// Insert synthetic error results for any missing ones.
+	// -------------------------------------------------------------------------
+	// Validation pass 2: ensure every tool_use has a corresponding tool_result
+	// in the immediately following user message.
+	// -------------------------------------------------------------------------
 	for (let i = 0; i < validated.length; i++) {
 		const msg = validated[i];
 		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
 
-		const toolUseIds = msg.content
-			.filter((b: any) => b.type === "tool_use")
-			.map((b: any) => b.id);
+		const toolUseIds = (msg.content as AnthropicContentBlock[])
+			.filter((b): b is AnthropicToolUseBlock => b.type === "tool_use")
+			.map((b) => b.id);
 		if (toolUseIds.length === 0) continue;
 
 		const nextMsg = i + 1 < validated.length ? validated[i + 1] : null;
 		const existingResultIds = new Set<string>();
 		if (nextMsg && nextMsg.role === "user" && Array.isArray(nextMsg.content)) {
-			for (const block of nextMsg.content) {
+			for (const block of nextMsg.content as AnthropicContentBlock[]) {
 				if (block.type === "tool_result") {
 					existingResultIds.add(block.tool_use_id);
 				}
 			}
 		}
 
-		const missingIds = toolUseIds.filter((id: string) => !existingResultIds.has(id));
+		const missingIds = toolUseIds.filter((id) => !existingResultIds.has(id));
 		if (missingIds.length > 0) {
-			const syntheticResults = missingIds.map((id: string) => ({
-				type: "tool_result",
+			const syntheticResults: AnthropicToolResultBlock[] = missingIds.map((id) => ({
+				type: "tool_result" as const,
 				tool_use_id: id,
 				content: "No result provided",
 				is_error: true,
 			}));
 
 			if (nextMsg && nextMsg.role === "user" && Array.isArray(nextMsg.content)) {
-				// Append synthetic results to existing user message
-				nextMsg.content = [...nextMsg.content, ...syntheticResults];
+				nextMsg.content = [...(nextMsg.content as AnthropicContentBlock[]), ...syntheticResults];
 			} else {
-				// Insert a new user message with synthetic results
 				validated.splice(i + 1, 0, { role: "user", content: syntheticResults });
 			}
 		}
 	}
 
-	// Merge consecutive messages of the same role (can happen after dropping messages)
-	const merged: any[] = [];
+	// -------------------------------------------------------------------------
+	// Merge consecutive same-role messages (can happen after dropping messages).
+	// Guard: never merge assistant messages containing thinking blocks, as
+	// thinking signatures are tied to specific message contexts.
+	// -------------------------------------------------------------------------
+	const merged: AnthropicMessage[] = [];
 	for (const msg of validated) {
 		const prev = merged.length > 0 ? merged[merged.length - 1] : null;
 		if (prev && prev.role === msg.role && prev.role === "user") {
-			// Merge user messages
 			if (typeof prev.content === "string" && typeof msg.content === "string") {
 				prev.content = prev.content + "\n" + msg.content;
 			} else {
-				const prevBlocks = typeof prev.content === "string"
-					? [{ type: "text", text: prev.content }]
-					: prev.content;
-				const msgBlocks = typeof msg.content === "string"
-					? [{ type: "text", text: msg.content }]
-					: msg.content;
+				const prevBlocks: AnthropicContentBlock[] =
+					typeof prev.content === "string"
+						? [{ type: "text", text: prev.content }]
+						: (prev.content as AnthropicContentBlock[]);
+				const msgBlocks: AnthropicContentBlock[] =
+					typeof msg.content === "string"
+						? [{ type: "text", text: msg.content }]
+						: (msg.content as AnthropicContentBlock[]);
 				prev.content = [...prevBlocks, ...msgBlocks];
 			}
 		} else if (prev && prev.role === msg.role && prev.role === "assistant") {
-			// Merge assistant messages
-			prev.content = [...(prev.content || []), ...(msg.content || [])];
+			// Don't merge assistant messages that contain thinking blocks
+			const prevHasThinking = Array.isArray(prev.content) &&
+				(prev.content as AnthropicContentBlock[]).some((b) => b.type === "thinking");
+			const msgHasThinking = Array.isArray(msg.content) &&
+				(msg.content as AnthropicContentBlock[]).some((b) => b.type === "thinking");
+
+			if (prevHasThinking || msgHasThinking) {
+				// Insert a separator user message to maintain alternation
+				merged.push({ role: "user", content: "(continued)" });
+				merged.push(msg);
+			} else {
+				prev.content = [
+					...(prev.content as AnthropicContentBlock[]),
+					...(msg.content as AnthropicContentBlock[]),
+				];
+			}
 		} else {
 			merged.push(msg);
 		}
@@ -492,7 +601,7 @@ function convertMessages(messages: Message[], model: Model<Api>, _tools?: Tool[]
 	}
 
 	// Ensure strict user/assistant alternation by inserting placeholder messages
-	const alternated: any[] = [];
+	const alternated: AnthropicMessage[] = [];
 	for (const msg of merged) {
 		const prev = alternated.length > 0 ? alternated[alternated.length - 1] : null;
 		if (prev && prev.role === msg.role) {
@@ -509,9 +618,10 @@ function convertMessages(messages: Message[], model: Model<Api>, _tools?: Tool[]
 	if (alternated.length > 0) {
 		const last = alternated[alternated.length - 1];
 		if (last.role === "user" && Array.isArray(last.content)) {
-			const lastBlock = last.content[last.content.length - 1];
-			if (lastBlock) {
-				lastBlock.cache_control = { type: "ephemeral" };
+			const blocks = last.content as AnthropicContentBlock[];
+			const lastBlock = blocks[blocks.length - 1];
+			if (lastBlock && "cache_control" in lastBlock || lastBlock?.type === "text" || lastBlock?.type === "tool_result") {
+				(lastBlock as AnthropicTextBlock | AnthropicToolResultBlock).cache_control = { type: "ephemeral" };
 			}
 		}
 	}
@@ -519,14 +629,18 @@ function convertMessages(messages: Message[], model: Model<Api>, _tools?: Tool[]
 	return alternated;
 }
 
-function convertTools(tools: Tool[]): any[] {
+function convertTools(tools: Tool[]): Array<{
+	name: string;
+	description: string;
+	input_schema: { type: "object"; properties: Record<string, unknown>; required: string[] };
+}> {
 	return tools.map((tool) => ({
 		name: tool.name,
 		description: tool.description,
 		input_schema: {
-			type: "object",
-			properties: (tool.parameters as any).properties || {},
-			required: (tool.parameters as any).required || [],
+			type: "object" as const,
+			properties: (tool.parameters as Record<string, unknown>)?.properties as Record<string, unknown> || {},
+			required: (tool.parameters as Record<string, unknown>)?.required as string[] || [],
 		},
 	}));
 }
@@ -550,38 +664,133 @@ function mapStopReason(reason: string): StopReason {
 // SSE Parser for Vertex AI streamRawPredict
 // =============================================================================
 
-async function* parseSSE(response: Response): AsyncGenerator<any> {
-	const reader = response.body!.getReader();
+async function* parseSSE(response: Response): AsyncGenerator<Record<string, unknown>> {
+	const body = response.body;
+	if (!body) {
+		throw new Error("Response body is null — cannot stream SSE");
+	}
+
+	const reader = body.getReader();
 	const decoder = new TextDecoder();
 	let buffer = "";
 
-	while (true) {
-		const { done, value } = await reader.read();
-		if (done) break;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
 
-		buffer += decoder.decode(value, { stream: true });
-		const lines = buffer.split("\n");
-		buffer = lines.pop()!; // Keep incomplete line in buffer
+			buffer += decoder.decode(value, { stream: true });
+			const lines = buffer.split("\n");
+			buffer = lines.pop()!; // Keep incomplete line in buffer
 
-		let eventType = "";
-		let data = "";
+			let eventType = "";
+			let dataLines: string[] = [];
 
-		for (const line of lines) {
-			if (line.startsWith("event: ")) {
-				eventType = line.slice(7).trim();
-			} else if (line.startsWith("data: ")) {
-				data = line.slice(6).trim();
-			} else if (line === "" && data) {
-				try {
-					const parsed = JSON.parse(data);
-					parsed._eventType = eventType;
-					yield parsed;
-				} catch {}
-				eventType = "";
-				data = "";
+			for (const line of lines) {
+				if (line.startsWith("event: ")) {
+					eventType = line.slice(7).trim();
+				} else if (line.startsWith("data: ")) {
+					// SSE spec: multiple data lines are concatenated with newlines
+					dataLines.push(line.slice(6));
+				} else if (line === "" && dataLines.length > 0) {
+					const data = dataLines.join("\n").trim();
+					dataLines = [];
+					try {
+						const parsed = JSON.parse(data);
+						parsed._eventType = eventType;
+						yield parsed;
+					} catch (parseError) {
+						// Check if this is an error event from the server
+						if (eventType === "error") {
+							throw new Error(`Vertex AI SSE error: ${data}`);
+						}
+						// Log non-error parse failures for debugging (non-fatal)
+						console.error(`[vertex-anthropic] Failed to parse SSE data: ${data.slice(0, 200)}`);
+					}
+					eventType = "";
+				}
+			}
+		}
+
+		// Handle any remaining data in buffer after stream ends
+		if (buffer.trim()) {
+			try {
+				const parsed = JSON.parse(buffer.trim());
+				parsed._eventType = "";
+				yield parsed;
+			} catch {
+				// Incomplete data at end of stream — non-fatal
+			}
+		}
+	} finally {
+		reader.releaseLock();
+	}
+}
+
+// =============================================================================
+// Retry Logic
+// =============================================================================
+
+interface FetchWithRetryOptions {
+	maxRetries?: number;
+	signal?: AbortSignal;
+	onRetry?: (attempt: number, status: number, delay: number) => void;
+}
+
+async function fetchWithRetry(
+	url: string,
+	init: RequestInit,
+	options: FetchWithRetryOptions = {},
+): Promise<Response> {
+	const { maxRetries = 3, signal, onRetry } = options;
+	let lastError: Error | null = null;
+
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		if (signal?.aborted) {
+			throw new Error("Request was aborted");
+		}
+
+		try {
+			const response = await fetch(url, { ...init, signal });
+
+			// Don't retry on success or client errors (except 429)
+			if (response.ok || (response.status < 500 && response.status !== 429)) {
+				return response;
+			}
+
+			// Retry on 429 (rate limit) and 5xx (server errors)
+			if (attempt < maxRetries) {
+				const retryAfterHeader = response.headers.get("retry-after");
+				const delay = retryAfterHeader
+					? Math.min(parseInt(retryAfterHeader, 10) * 1000, 30000)
+					: Math.min(1000 * Math.pow(2, attempt) + Math.random() * 500, 30000);
+
+				onRetry?.(attempt + 1, response.status, delay);
+				await new Promise((resolve) => setTimeout(resolve, delay));
+				continue;
+			}
+
+			// Exhausted retries — return the error response for the caller to handle
+			return response;
+		} catch (error) {
+			lastError = error instanceof Error ? error : new Error(String(error));
+
+			// Don't retry on abort
+			if (signal?.aborted || lastError.name === "AbortError") {
+				throw lastError;
+			}
+
+			// Retry network errors
+			if (attempt < maxRetries) {
+				const delay = Math.min(1000 * Math.pow(2, attempt) + Math.random() * 500, 30000);
+				onRetry?.(attempt + 1, 0, delay);
+				await new Promise((resolve) => setTimeout(resolve, delay));
+				continue;
 			}
 		}
 	}
+
+	throw lastError || new Error("Request failed after retries");
 }
 
 // =============================================================================
@@ -594,6 +803,15 @@ function streamVertexAnthropic(
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
+	let streamEnded = false;
+
+	/** Safely push an end/error event and close the stream. */
+	function safeEnd(event: Parameters<typeof stream.push>[0]): void {
+		if (streamEnded) return;
+		streamEnded = true;
+		stream.push(event);
+		stream.end();
+	}
 
 	(async () => {
 		const output: AssistantMessage = {
@@ -616,18 +834,15 @@ function streamVertexAnthropic(
 
 		try {
 			const config = getConfig();
-			const project = (model as any).project || config.project;
-			const region = (model as any).region || config.region;
-			const gcloudPath = (model as any).gcloudPath || config.gcloudPath;
+			const project = (model as { project?: string }).project || config.project;
+			const region = (model as { region?: string }).region || config.region;
+			const gcloudPath = (model as { gcloudPath?: string }).gcloudPath || config.gcloudPath;
 
-			// Get access token
-			const token = execSync(`${gcloudPath} auth print-access-token`, {
-				encoding: "utf-8",
-				timeout: 10000,
-			}).trim();
+			// Get access token (async, cached)
+			let token = await getAccessToken(gcloudPath);
 
 			// Build Anthropic Messages API request body
-			const body: any = {
+			const body: Record<string, unknown> = {
 				anthropic_version: "vertex-2023-10-16",
 				messages: convertMessages(context.messages, model, context.tools),
 				max_tokens: options?.maxTokens || Math.floor(model.maxTokens / 3),
@@ -650,23 +865,20 @@ function streamVertexAnthropic(
 
 			// Handle thinking/reasoning
 			if (options?.reasoning && model.reasoning) {
-				// Adaptive thinking is only supported on Claude 4.6 models (Opus 4.6, Sonnet 4.6)
+				// Adaptive thinking is supported on Claude 4.6+ models
 				const isAdaptiveSupported = model.id.includes("-4-6");
-				const isOpus46 = model.id.includes("opus-4-6");
 
 				const customBudget = options.thinkingBudgets?.[options.reasoning as keyof typeof options.thinkingBudgets];
 
 				// Provide plenty of max_tokens for xhigh
 				if (options.reasoning === "xhigh") {
-					body.max_tokens = Math.max(body.max_tokens, 64000);
+					body.max_tokens = Math.max(body.max_tokens as number, 64000);
 				}
 
 				if (customBudget) {
 					body.thinking = { type: "enabled", budget_tokens: customBudget };
-					// max_tokens MUST be greater than budget_tokens
-					body.max_tokens = Math.max(body.max_tokens, customBudget + 1024);
+					body.max_tokens = Math.max(body.max_tokens as number, customBudget + 1024);
 				} else if (isAdaptiveSupported) {
-					// Use Adaptive Thinking for newer models
 					let effort = "high";
 					if (options.reasoning === "xhigh") effort = "max";
 					else if (options.reasoning === "high") effort = "high";
@@ -676,8 +888,6 @@ function streamVertexAnthropic(
 					body.thinking = { type: "adaptive" };
 					body.output_config = { effort };
 				} else {
-					// Fallback to manual budgeting for older models
-					// Clamp budget to leave room for output: max_tokens MUST be > budget_tokens
 					const defaultBudgets: Record<string, number> = {
 						minimal: 1024,
 						low: 4096,
@@ -687,35 +897,51 @@ function streamVertexAnthropic(
 					};
 					const budget = defaultBudgets[options.reasoning] ?? 10240;
 					body.thinking = { type: "enabled", budget_tokens: budget };
-					// Ensure max_tokens always exceeds budget_tokens
-					body.max_tokens = Math.max(body.max_tokens, budget + 1024);
-					// If model can't support this, clamp budget down instead
-					if (body.max_tokens > model.maxTokens) {
+					body.max_tokens = Math.max(body.max_tokens as number, budget + 1024);
+					if ((body.max_tokens as number) > model.maxTokens) {
 						body.max_tokens = model.maxTokens;
-						body.thinking.budget_tokens = Math.max(1024, model.maxTokens - 1024);
+						(body.thinking as Record<string, unknown>).budget_tokens = Math.max(1024, model.maxTokens - 1024);
 					}
 				}
 			}
 
-			// Make request to Vertex AI streamRawPredict endpoint
-			const vertexModelId = (model as any).vertexModelId || model.id;
-			
-			// Handle global region (no region prefix in domain)
-			const endpoint = region === "global"
-				? "aiplatform.googleapis.com"
-				: `${region}-aiplatform.googleapis.com`;
-			
+			// Build Vertex AI endpoint URL
+			const vertexModelId = (model as { vertexModelId?: string }).vertexModelId || model.id;
+
+			const endpoint =
+				region === "global"
+					? "aiplatform.googleapis.com"
+					: `${region}-aiplatform.googleapis.com`;
+
 			const url = `https://${endpoint}/v1/projects/${project}/locations/${region}/publishers/anthropic/models/${vertexModelId}:streamRawPredict`;
 
-			const response = await fetch(url, {
-				method: "POST",
-				headers: {
-					"Authorization": `Bearer ${token}`,
-					"Content-Type": "application/json",
+			// Make request with retry logic
+			const response = await fetchWithRetry(
+				url,
+				{
+					method: "POST",
+					headers: {
+						Authorization: `Bearer ${token}`,
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify(body),
 				},
-				body: JSON.stringify(body),
-				signal: options?.signal,
-			});
+				{
+					maxRetries: 3,
+					signal: options?.signal,
+					onRetry: (attempt, status, delay) => {
+						// On 401, invalidate token cache so next retry gets a fresh token
+						if (status === 401) {
+							invalidateTokenCache();
+							// Re-fetch token synchronously for the retry
+							// (the retry loop will use the new token via the Authorization header)
+						}
+						console.error(
+							`[vertex-anthropic] Retry ${attempt}: status=${status}, delay=${Math.round(delay)}ms`,
+						);
+					},
+				},
+			);
 
 			if (!response.ok) {
 				const errorText = await response.text();
@@ -724,98 +950,135 @@ function streamVertexAnthropic(
 
 			stream.push({ type: "start", partial: output });
 
-			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
-			const blocks = output.content as Block[];
+			// Use a Map for O(1) lookup instead of findIndex
+			type StreamBlock = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & {
+				index: number;
+			};
+			const blocksByStreamIndex = new Map<number, { arrayIndex: number; block: StreamBlock }>();
 
 			for await (const event of parseSSE(response)) {
-				if (event.type === "message_start") {
-					output.usage.input = event.message?.usage?.input_tokens || 0;
-					output.usage.output = event.message?.usage?.output_tokens || 0;
-					output.usage.cacheRead = event.message?.usage?.cache_read_input_tokens || 0;
-					output.usage.cacheWrite = event.message?.usage?.cache_creation_input_tokens || 0;
-					output.usage.totalTokens =
-						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-					calculateCost(model, output.usage);
-				} else if (event.type === "content_block_start") {
-					if (event.content_block.type === "text") {
-						output.content.push({ type: "text", text: "", index: event.index } as any);
-						stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
-					} else if (event.content_block.type === "thinking") {
-						output.content.push({
-							type: "thinking",
-							thinking: "",
-							thinkingSignature: "",
-							index: event.index,
-						} as any);
-						stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
-					} else if (event.content_block.type === "tool_use") {
-						output.content.push({
-							type: "toolCall",
-							id: event.content_block.id,
-							name: event.content_block.name,
-							arguments: {},
-							partialJson: "",
-							index: event.index,
-						} as any);
-						stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
-					}
-				} else if (event.type === "content_block_delta") {
-					const index = blocks.findIndex((b) => b.index === event.index);
-					const block = blocks[index];
-					if (!block) continue;
+				const eventType = event.type as string;
 
-					if (event.delta.type === "text_delta" && block.type === "text") {
-						block.text += event.delta.text;
-						stream.push({ type: "text_delta", contentIndex: index, delta: event.delta.text, partial: output });
-					} else if (event.delta.type === "thinking_delta" && block.type === "thinking") {
-						block.thinking += event.delta.thinking;
-						stream.push({
-							type: "thinking_delta",
-							contentIndex: index,
-							delta: event.delta.thinking,
-							partial: output,
-						});
-					} else if (event.delta.type === "input_json_delta" && block.type === "toolCall") {
-						(block as any).partialJson += event.delta.partial_json;
-						try {
-							block.arguments = JSON.parse((block as any).partialJson);
-						} catch {}
-						stream.push({
-							type: "toolcall_delta",
-							contentIndex: index,
-							delta: event.delta.partial_json,
-							partial: output,
-						});
-					} else if (event.delta.type === "signature_delta" && block.type === "thinking") {
-						block.thinkingSignature = (block.thinkingSignature || "") + (event.delta as any).signature;
-					}
-				} else if (event.type === "content_block_stop") {
-					const index = blocks.findIndex((b) => b.index === event.index);
-					const block = blocks[index];
-					if (!block) continue;
-
-					delete (block as any).index;
-					if (block.type === "text") {
-						stream.push({ type: "text_end", contentIndex: index, content: block.text, partial: output });
-					} else if (block.type === "thinking") {
-						stream.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: output });
-					} else if (block.type === "toolCall") {
-						try {
-							block.arguments = JSON.parse((block as any).partialJson);
-						} catch {}
-						delete (block as any).partialJson;
-						stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: output });
-					}
-				} else if (event.type === "message_delta") {
-					if (event.delta?.stop_reason) {
-						output.stopReason = mapStopReason(event.delta.stop_reason);
-					}
-					if (event.usage) {
-						output.usage.output = event.usage.output_tokens || output.usage.output;
+				if (eventType === "message_start") {
+					const usage = (event.message as Record<string, unknown>)?.usage as Record<string, number> | undefined;
+					if (usage) {
+						output.usage.input = usage.input_tokens || 0;
+						output.usage.output = usage.output_tokens || 0;
+						output.usage.cacheRead = usage.cache_read_input_tokens || 0;
+						output.usage.cacheWrite = usage.cache_creation_input_tokens || 0;
 						output.usage.totalTokens =
 							output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 						calculateCost(model, output.usage);
 					}
+				} else if (eventType === "content_block_start") {
+					const contentBlock = event.content_block as Record<string, string>;
+					const streamIndex = event.index as number;
+
+					if (contentBlock.type === "text") {
+						const block = { type: "text" as const, text: "", index: streamIndex } as StreamBlock;
+						output.content.push(block as TextContent);
+						const arrayIndex = output.content.length - 1;
+						blocksByStreamIndex.set(streamIndex, { arrayIndex, block });
+						stream.push({ type: "text_start", contentIndex: arrayIndex, partial: output });
+					} else if (contentBlock.type === "thinking") {
+						const block = {
+							type: "thinking" as const,
+							thinking: "",
+							thinkingSignature: "",
+							index: streamIndex,
+						} as StreamBlock;
+						output.content.push(block as ThinkingContent);
+						const arrayIndex = output.content.length - 1;
+						blocksByStreamIndex.set(streamIndex, { arrayIndex, block });
+						stream.push({ type: "thinking_start", contentIndex: arrayIndex, partial: output });
+					} else if (contentBlock.type === "tool_use") {
+						const block = {
+							type: "toolCall" as const,
+							id: contentBlock.id,
+							name: contentBlock.name,
+							arguments: {},
+							partialJson: "",
+							index: streamIndex,
+						} as StreamBlock;
+						output.content.push(block as unknown as ToolCall);
+						const arrayIndex = output.content.length - 1;
+						blocksByStreamIndex.set(streamIndex, { arrayIndex, block });
+						stream.push({ type: "toolcall_start", contentIndex: arrayIndex, partial: output });
+					}
+				} else if (eventType === "content_block_delta") {
+					const entry = blocksByStreamIndex.get(event.index as number);
+					if (!entry) continue;
+					const { arrayIndex, block } = entry;
+					const delta = event.delta as Record<string, string>;
+
+					if (delta.type === "text_delta" && block.type === "text") {
+						block.text += delta.text;
+						stream.push({ type: "text_delta", contentIndex: arrayIndex, delta: delta.text, partial: output });
+					} else if (delta.type === "thinking_delta" && block.type === "thinking") {
+						block.thinking += delta.thinking;
+						stream.push({
+							type: "thinking_delta",
+							contentIndex: arrayIndex,
+							delta: delta.thinking,
+							partial: output,
+						});
+					} else if (delta.type === "input_json_delta" && block.type === "toolCall") {
+						(block as StreamBlock & { partialJson: string }).partialJson += delta.partial_json;
+						try {
+							block.arguments = JSON.parse(
+								(block as StreamBlock & { partialJson: string }).partialJson,
+							);
+						} catch {}
+						stream.push({
+							type: "toolcall_delta",
+							contentIndex: arrayIndex,
+							delta: delta.partial_json,
+							partial: output,
+						});
+					} else if (delta.type === "signature_delta" && block.type === "thinking") {
+						block.thinkingSignature = (block.thinkingSignature || "") + delta.signature;
+					}
+				} else if (eventType === "content_block_stop") {
+					const entry = blocksByStreamIndex.get(event.index as number);
+					if (!entry) continue;
+					const { arrayIndex, block } = entry;
+
+					delete (block as any).index;
+					if (block.type === "text") {
+						stream.push({ type: "text_end", contentIndex: arrayIndex, content: block.text, partial: output });
+					} else if (block.type === "thinking") {
+						stream.push({
+							type: "thinking_end",
+							contentIndex: arrayIndex,
+							content: block.thinking,
+							partial: output,
+						});
+					} else if (block.type === "toolCall") {
+						try {
+							block.arguments = JSON.parse(
+								(block as any).partialJson,
+							);
+						} catch {}
+						delete (block as any).partialJson;
+						stream.push({ type: "toolcall_end", contentIndex: arrayIndex, toolCall: block, partial: output });
+					}
+				} else if (eventType === "message_delta") {
+					const delta = event.delta as Record<string, string> | undefined;
+					if (delta?.stop_reason) {
+						output.stopReason = mapStopReason(delta.stop_reason);
+					}
+					const usage = event.usage as Record<string, number> | undefined;
+					if (usage) {
+						output.usage.output = usage.output_tokens || output.usage.output;
+						output.usage.totalTokens =
+							output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+						calculateCost(model, output.usage);
+					}
+				} else if (eventType === "error") {
+					const error = event.error as Record<string, string> | undefined;
+					throw new Error(
+						`Vertex AI stream error: ${error?.message || JSON.stringify(event)}`,
+					);
 				}
 			}
 
@@ -823,11 +1086,12 @@ function streamVertexAnthropic(
 				throw new Error("Request was aborted");
 			}
 
-			// Clean up any remaining index properties
-			for (const block of output.content) delete (block as any).index;
+			// Clean up internal properties from content blocks
+			for (const block of output.content) {
+				delete (block as any).index;
+			}
 
-			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
-			stream.end();
+			safeEnd({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 		} catch (error) {
 			for (const block of output.content) {
 				delete (block as any).index;
@@ -835,12 +1099,77 @@ function streamVertexAnthropic(
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
-			stream.push({ type: "error", reason: output.stopReason, error: output });
-			stream.end();
+			safeEnd({ type: "error", reason: output.stopReason, error: output });
 		}
 	})();
 
 	return stream;
+}
+
+// =============================================================================
+// Login Flow Helpers
+// =============================================================================
+
+function checkGcloudInstalled(gcloudPath: string): boolean {
+	try {
+		execFileSync(gcloudPath, ["version"], { stdio: "ignore", timeout: 2000 });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function checkGcloudAuthenticated(gcloudPath: string): boolean {
+	try {
+		const token = execFileSync(gcloudPath, ["auth", "print-access-token"], {
+			encoding: "utf-8",
+			timeout: 5000,
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+		return !!token && !token.includes("ERROR") && token.length >= 20;
+	} catch {
+		return false;
+	}
+}
+
+function getCurrentProject(gcloudPath: string): string | null {
+	try {
+		const project = execFileSync(gcloudPath, ["config", "get-value", "project"], {
+			encoding: "utf-8",
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+		return project && project !== "(unset)" ? project : null;
+	} catch {
+		return null;
+	}
+}
+
+function listProjects(gcloudPath: string): string[] {
+	try {
+		return execFileSync(gcloudPath, ["projects", "list", "--format=value(projectId)"], {
+			encoding: "utf-8",
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: 10000,
+		})
+			.trim()
+			.split("\n")
+			.filter((p) => p && p !== "(unset)");
+	} catch {
+		return [];
+	}
+}
+
+function isVertexApiEnabled(gcloudPath: string): boolean {
+	try {
+		const enabled = execFileSync(
+			gcloudPath,
+			["services", "list", "--enabled", "--filter=name:aiplatform.googleapis.com", "--format=value(name)"],
+			{ encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] },
+		).trim();
+		return !!enabled;
+	} catch {
+		return false;
+	}
 }
 
 // =============================================================================
@@ -850,42 +1179,32 @@ function streamVertexAnthropic(
 export default function (pi: ExtensionAPI) {
 	const config = getConfig();
 
-	// Handle global region endpoint
-	const endpoint = config.region === "global"
-		? "aiplatform.googleapis.com"
-		: `${config.region}-aiplatform.googleapis.com`;
+	const endpoint =
+		config.region === "global" ? "aiplatform.googleapis.com" : `${config.region}-aiplatform.googleapis.com`;
 
-	// Register provider with OAuth-style /login support
 	pi.registerProvider("vertex-anthropic", {
 		baseUrl: `https://${endpoint}`,
 		api: "anthropic-messages",
 
-		// OAuth configuration for /login command
 		oauth: {
 			name: "Google Cloud Vertex AI (gcloud)",
 			async login(callbacks) {
 				callbacks.onAuth({ type: "progress", message: "Setting up Google Cloud Vertex AI..." });
 
-				// Step 1: Check if gcloud is installed
+				// Step 1: Check gcloud CLI
 				let gcloudPath = config.gcloudPath;
-				try {
-					execSync(`${gcloudPath} version`, { stdio: "ignore", timeout: 2000 });
-				} catch {
+				if (!checkGcloudInstalled(gcloudPath)) {
 					const install = await callbacks.onPrompt({
-						message: "gcloud CLI not found. Install Google Cloud SDK?\n\n" +
+						message:
+							"gcloud CLI not found. Install Google Cloud SDK?\n\n" +
 							"This will download and install gcloud from:\n" +
 							"https://cloud.google.com/sdk/docs/install\n\n" +
 							"(y/n)",
 					});
 
 					if (install?.toLowerCase() === "y") {
-						callbacks.onAuth({
-							type: "info",
-							message: "Opening installation guide in browser...",
-						});
-						callbacks.onAuth({
-							url: "https://cloud.google.com/sdk/docs/install",
-						});
+						callbacks.onAuth({ type: "info", message: "Opening installation guide in browser..." });
+						callbacks.onAuth({ url: "https://cloud.google.com/sdk/docs/install" });
 						throw new Error("Please install gcloud CLI and run /login again");
 					} else {
 						throw new Error("gcloud CLI required. Install from: https://cloud.google.com/sdk/docs/install");
@@ -894,33 +1213,18 @@ export default function (pi: ExtensionAPI) {
 
 				// Step 2: Check authentication
 				callbacks.onAuth({ type: "progress", message: "Checking gcloud authentication..." });
-				let needsAuth = false;
-				try {
-					const token = execSync(`${gcloudPath} auth print-access-token`, {
-						encoding: "utf-8",
-						timeout: 5000,
-						stdio: ["ignore", "pipe", "ignore"],
-					}).trim();
-					needsAuth = !token || token.includes("ERROR") || token.length < 20;
-				} catch {
-					needsAuth = true;
-				}
-
-				if (needsAuth) {
+				if (!checkGcloudAuthenticated(gcloudPath)) {
 					const doAuth = await callbacks.onPrompt({
 						message: "Not authenticated with gcloud. Run 'gcloud auth login' now? (y/n)",
 					});
 
 					if (doAuth?.toLowerCase() === "y") {
 						callbacks.onAuth({ type: "progress", message: "Running gcloud auth login..." });
-						callbacks.onAuth({
-							type: "info",
-							message: "A browser window will open for authentication",
-						});
+						callbacks.onAuth({ type: "info", message: "A browser window will open for authentication" });
 
 						try {
-							execSync(`${gcloudPath} auth login`, { stdio: "inherit" });
-						} catch (error) {
+							execFileSync(gcloudPath, ["auth", "login"], { stdio: "inherit" });
+						} catch {
 							throw new Error("Authentication failed. Please try: gcloud auth login");
 						}
 					} else {
@@ -933,55 +1237,35 @@ export default function (pi: ExtensionAPI) {
 				let project = process.env.VERTEX_PROJECT_ID;
 
 				if (!project || project === "your-gcp-project-id") {
-					// Try to get current project
-					try {
-						const currentProject = execSync(`${gcloudPath} config get-value project`, {
-							encoding: "utf-8",
-							stdio: ["ignore", "pipe", "ignore"],
-						}).trim();
-
-						if (currentProject && currentProject !== "(unset)") {
-							const use = await callbacks.onPrompt({
-								message: `Use current project '${currentProject}'? (y/n)`,
-							});
-							if (use?.toLowerCase() === "y") {
-								project = currentProject;
-							}
+					const currentProject = getCurrentProject(gcloudPath);
+					if (currentProject) {
+						const use = await callbacks.onPrompt({
+							message: `Use current project '${currentProject}'? (y/n)`,
+						});
+						if (use?.toLowerCase() === "y") {
+							project = currentProject;
 						}
-					} catch {}
+					}
 
 					if (!project) {
-						// List available projects
 						let projectPrompt = "Enter GCP project ID:";
-						try {
-							const projects = execSync(`${gcloudPath} projects list --format="value(projectId)"`, {
-								encoding: "utf-8",
-								stdio: ["ignore", "pipe", "ignore"],
-								timeout: 10000,
-							}).trim().split("\n").filter(p => p && p !== "(unset)");
+						const projects = listProjects(gcloudPath);
+						if (projects.length > 0 && projects.length < 20) {
+							projectPrompt = `Available projects:\n${projects.map((p) => `  - ${p}`).join("\n")}\n\nEnter project ID:`;
+						}
 
-							if (projects.length > 0 && projects.length < 20) {
-								projectPrompt = `Available projects:\n${projects.map(p => `  - ${p}`).join("\n")}\n\nEnter project ID:`;
-							}
-						} catch {}
-
-						const projectInput = await callbacks.onPrompt({
-							message: projectPrompt,
-						});
-
+						const projectInput = await callbacks.onPrompt({ message: projectPrompt });
 						if (!projectInput || projectInput.trim() === "") {
 							throw new Error("Project ID required");
 						}
-						project = projectInput.trim();
+						project = validateProjectId(projectInput);
 
-						// Set as default
 						try {
-							execSync(`${gcloudPath} config set project ${project}`, { stdio: "ignore" });
+							execFileSync(gcloudPath, ["config", "set", "project", project], { stdio: "ignore" });
 						} catch {}
 					}
 				}
 
-				// Save to environment (user will need to add to their shell config)
 				process.env.VERTEX_PROJECT_ID = project;
 
 				// Step 4: Select region
@@ -990,7 +1274,8 @@ export default function (pi: ExtensionAPI) {
 
 				if (!region) {
 					const regionChoice = await callbacks.onPrompt({
-						message: "Select region:\n\n" +
+						message:
+							"Select region:\n\n" +
 							"  1. global (recommended for latest models)\n" +
 							"  2. us-east5\n" +
 							"  3. us-central1\n" +
@@ -999,104 +1284,85 @@ export default function (pi: ExtensionAPI) {
 							"Enter 1-5 or custom region name:",
 					});
 
-					if (regionChoice === "1") {
-						region = "global";
-					} else if (regionChoice === "2") {
-						region = "us-east5";
-					} else if (regionChoice === "3") {
-						region = "us-central1";
-					} else if (regionChoice === "4") {
-						region = "europe-west1";
-					} else if (regionChoice === "5") {
-						region = "asia-southeast1";
-					} else if (regionChoice && regionChoice.trim()) {
-						region = regionChoice.trim();
-					} else {
-						region = "global"; // Default to global
-					}
-
+					const regionMap: Record<string, string> = {
+						"1": "global",
+						"2": "us-east5",
+						"3": "us-central1",
+						"4": "europe-west1",
+						"5": "asia-southeast1",
+					};
+					region = regionMap[regionChoice || ""] || (regionChoice?.trim() ? validateRegion(regionChoice) : "global");
 					process.env.VERTEX_REGION = region;
 				}
 
 				// Step 5: Enable Vertex AI API
 				callbacks.onAuth({ type: "progress", message: "Checking Vertex AI API..." });
 				try {
-					const enabled = execSync(
-						`${gcloudPath} services list --enabled --filter="name:aiplatform.googleapis.com" --format="value(name)"`,
-						{ encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }
-					).trim();
-
-					if (!enabled) {
+					if (!isVertexApiEnabled(gcloudPath)) {
 						const enable = await callbacks.onPrompt({
 							message: "Vertex AI API not enabled. Enable it now? (y/n)",
 						});
 
 						if (enable?.toLowerCase() === "y") {
-							callbacks.onAuth({ type: "progress", message: "Enabling Vertex AI API (this may take a minute)..." });
-							execSync(`${gcloudPath} services enable aiplatform.googleapis.com`, { stdio: "inherit" });
+							callbacks.onAuth({
+								type: "progress",
+								message: "Enabling Vertex AI API (this may take a minute)...",
+							});
+							execFileSync(gcloudPath, ["services", "enable", "aiplatform.googleapis.com"], {
+								stdio: "inherit",
+							});
 							callbacks.onAuth({ type: "info", message: "Vertex AI API enabled!" });
 						} else {
 							callbacks.onAuth({
 								type: "warning",
-								message: "API not enabled. You'll need to enable it manually:\n" +
+								message:
+									"API not enabled. You'll need to enable it manually:\n" +
 									`  gcloud services enable aiplatform.googleapis.com --project=${project}`,
 							});
 						}
 					}
-				} catch (error) {
+				} catch {
 					callbacks.onAuth({
 						type: "warning",
-						message: "Could not check API status. If requests fail, enable it manually:\n" +
+						message:
+							"Could not check API status. If requests fail, enable it manually:\n" +
 							`  gcloud services enable aiplatform.googleapis.com --project=${project}`,
 					});
 				}
 
 				// Step 6: Test authentication
 				callbacks.onAuth({ type: "progress", message: "Testing authentication..." });
-				try {
-					const token = execSync(`${gcloudPath} auth print-access-token`, {
-						encoding: "utf-8",
-						timeout: 5000,
-					}).trim();
-
-					if (!token || token.length < 20) {
-						throw new Error("Invalid token");
-					}
-				} catch (error) {
+				if (!checkGcloudAuthenticated(gcloudPath)) {
 					throw new Error("Authentication test failed. Please run: gcloud auth login");
 				}
 
-				// Success! Show next steps
 				callbacks.onAuth({
 					type: "success",
-					message: `✓ Configured successfully!\n\n` +
+					message:
+						`✓ Configured successfully!\n\n` +
 						`Project: ${project}\n` +
 						`Region: ${region}\n\n` +
 						`Settings persisted to ~/.pi/agent/auth.json.\n` +
 						`If authentication fails later, run: gcloud auth login`,
 				});
 
-				// Return credentials with project/region persisted in auth.json
 				return {
 					refresh: Date.now().toString(),
 					access: "gcloud",
-					expires: Date.now() + 1000 * 60 * 60 * 24 * 365, // 1 year
+					expires: Date.now() + 1000 * 60 * 60 * 24 * 365,
 					project,
 					region,
 				};
 			},
+
 			async refreshToken(credentials) {
-				// Tokens are always fresh from gcloud, preserve project/region
-				return {
-					...credentials,
-					refresh: Date.now().toString(),
-				};
+				return { ...credentials, refresh: Date.now().toString() };
 			},
+
 			getApiKey(_credentials) {
-				// Get fresh token from gcloud each time
 				try {
 					const gcloudPath = config.gcloudPath;
-					const token = execSync(`${gcloudPath} auth print-access-token`, {
+					const token = execFileSync(gcloudPath, ["auth", "print-access-token"], {
 						encoding: "utf-8",
 						timeout: 5000,
 						stdio: ["ignore", "pipe", "pipe"],
@@ -1105,7 +1371,6 @@ export default function (pi: ExtensionAPI) {
 					if (!token || token.length < 20) {
 						throw new Error("Invalid token from gcloud");
 					}
-
 					return token;
 				} catch (error) {
 					const msg = error instanceof Error ? error.message : "Unknown error";
@@ -1115,7 +1380,6 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		models: [
-			// Claude Opus 4.6 (Latest Flagship - Extended Thinking)
 			{
 				id: "claude-opus-4-6",
 				name: "Claude Opus 4.6 (Vertex)",
@@ -1125,8 +1389,6 @@ export default function (pi: ExtensionAPI) {
 				contextWindow: 200000,
 				maxTokens: 64000,
 			},
-
-			// Claude Opus 4.5 (Extended Thinking)
 			{
 				id: "claude-opus-4-5@20251101",
 				name: "Claude Opus 4.5 (Vertex)",
@@ -1136,8 +1398,6 @@ export default function (pi: ExtensionAPI) {
 				contextWindow: 200000,
 				maxTokens: 64000,
 			},
-
-			// Claude Sonnet 4.5 (Extended Thinking)
 			{
 				id: "claude-sonnet-4-5@20250929",
 				name: "Claude Sonnet 4.5 (Vertex)",
@@ -1147,8 +1407,6 @@ export default function (pi: ExtensionAPI) {
 				contextWindow: 200000,
 				maxTokens: 64000,
 			},
-
-			// Claude Haiku 4.5 (Fast Extended Thinking)
 			{
 				id: "claude-haiku-4-5@20251001",
 				name: "Claude Haiku 4.5 (Vertex)",
@@ -1158,8 +1416,6 @@ export default function (pi: ExtensionAPI) {
 				contextWindow: 200000,
 				maxTokens: 64000,
 			},
-
-			// Claude 3.5 Sonnet v2
 			{
 				id: "claude-3-5-sonnet-v2@20241022",
 				name: "Claude 3.5 Sonnet v2 (Vertex)",
@@ -1169,8 +1425,6 @@ export default function (pi: ExtensionAPI) {
 				contextWindow: 200000,
 				maxTokens: 8192,
 			},
-
-			// Claude 3.5 Sonnet (Original)
 			{
 				id: "claude-3-5-sonnet@20240620",
 				name: "Claude 3.5 Sonnet (Vertex)",
@@ -1180,8 +1434,6 @@ export default function (pi: ExtensionAPI) {
 				contextWindow: 200000,
 				maxTokens: 8192,
 			},
-
-			// Claude 3.5 Haiku
 			{
 				id: "claude-3-5-haiku@20241022",
 				name: "Claude 3.5 Haiku (Vertex)",
@@ -1191,8 +1443,6 @@ export default function (pi: ExtensionAPI) {
 				contextWindow: 200000,
 				maxTokens: 8192,
 			},
-
-			// Claude 3 Opus
 			{
 				id: "claude-3-opus@20240229",
 				name: "Claude 3 Opus (Vertex)",
@@ -1202,8 +1452,6 @@ export default function (pi: ExtensionAPI) {
 				contextWindow: 200000,
 				maxTokens: 4096,
 			},
-
-			// Claude 3 Sonnet
 			{
 				id: "claude-3-sonnet@20240229",
 				name: "Claude 3 Sonnet (Vertex)",
@@ -1213,8 +1461,6 @@ export default function (pi: ExtensionAPI) {
 				contextWindow: 200000,
 				maxTokens: 4096,
 			},
-
-			// Claude 3 Haiku
 			{
 				id: "claude-3-haiku@20240307",
 				name: "Claude 3 Haiku (Vertex)",
@@ -1229,13 +1475,9 @@ export default function (pi: ExtensionAPI) {
 		streamSimple: streamVertexAnthropic,
 	});
 
-	// Provide helpful status when extension loads
 	pi.on("session_start", async (_event, ctx) => {
 		if (config.project === "your-gcp-project-id") {
-			ctx.ui?.notify(
-				"Vertex AI: Run /login to configure project and region",
-				"warning",
-			);
+			ctx.ui?.notify("Vertex AI: Run /login to configure project and region", "warning");
 		}
 	});
 }

@@ -28,9 +28,7 @@
     "@mariozechner/pi-coding-agent": ">=0.0.1",
     "@mariozechner/pi-ai": ">=0.0.1"
   },
-  "dependencies": {
-    "@anthropic-ai/sdk": "^0.32.1"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.7.2"
