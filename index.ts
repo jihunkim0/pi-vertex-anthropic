@@ -1481,3 +1481,22 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 }
+
+// =============================================================================
+// Test exports — internal functions exported for testing only
+// =============================================================================
+
+export const __test__ = {
+	validateProjectId,
+	validateRegion,
+	transformMessages,
+	convertMessages,
+	convertTools,
+	sanitizeSurrogates,
+	normalizeToolCallId,
+	parseSSE,
+	fetchWithRetry,
+	getAccessToken,
+	invalidateTokenCache,
+	mapStopReason,
+};
