@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-03-14
+
+### Added
+- **Claude Sonnet 4.6** - Frontier performance model with 1M context window ($3/$15 per 1M tokens)
+
+### Changed
+- Increased **Claude Opus 4.6** context window from 200K to 1M tokens (now GA)
+- Models array now includes 10 models total (with Sonnet 4.6 added)
+
 ## [2.2.0] - 2025-02-05
 
 ### Added

@@ -96,11 +96,18 @@ All Claude models available on Vertex AI are supported:
 #### Claude 4.6 & 4.5 Generation (Extended Thinking)
 
 - **Claude Opus 4.6** (`claude-opus-4-6`)
-  - 200K context, 64K max output
+  - 1M context, 64K max output
   - ✅ Extended thinking/reasoning
   - ✅ Image support
   - Cost: $5/1M input, $25/1M output
   - **Latest Flagship** - Most intelligent model
+
+- **Claude Sonnet 4.6** (`claude-sonnet-4-6`)
+  - 1M context, 64K max output
+  - ✅ Extended thinking/reasoning
+  - ✅ Image support
+  - Cost: $3/1M input, $15/1M output
+  - **Frontier Performance**
 
 - **Claude Opus 4.5** (`claude-opus-4-5@20251101`)
   - 200K context, 64K max output
@@ -314,6 +321,8 @@ The `/login` command lets you choose your preferred region.
 |-------|---------------------|-----------|
 | Claude Opus 4.6 Input | $5/1M tokens | $5/1M tokens |
 | Claude Opus 4.6 Output | $25/1M tokens | $25/1M tokens |
+| Claude Sonnet 4.6 Input | $3/1M tokens | $3/1M tokens |
+| Claude Sonnet 4.6 Output | $15/1M tokens | $15/1M tokens |
 | Claude Sonnet 4.5 Input | $3/1M tokens | $3/1M tokens |
 | Claude Sonnet 4.5 Output | $15/1M tokens | $15/1M tokens |
 | Claude Haiku 4.5 Input | $1/1M tokens | $1/1M tokens |
@@ -321,7 +330,7 @@ The `/login` command lets you choose your preferred region.
 | Cache Reads | 10% of input cost | 10% of input cost |
 | Cache Writes | 25% of input cost | 25% of input cost |
 
-*Prices as of February 2025. Check GCP pricing for current rates.*
+*Prices as of March 2026. Check GCP pricing for current rates.*
 
 ## Contributing
 
