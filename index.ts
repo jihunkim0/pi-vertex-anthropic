@@ -1122,7 +1122,18 @@ export default function (pi: ExtensionAPI) {
 				reasoning: true,
 				input: ["text", "image"],
 				cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-				contextWindow: 200000,
+				contextWindow: 1000000,
+				maxTokens: 64000,
+			},
+
+			// Claude Sonnet 4.6 (Extended Thinking)
+			{
+				id: "claude-sonnet-4-6",
+				name: "Claude Sonnet 4.6 (Vertex)",
+				reasoning: true,
+				input: ["text", "image"],
+				cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+				contextWindow: 1000000,
 				maxTokens: 64000,
 			},
 
