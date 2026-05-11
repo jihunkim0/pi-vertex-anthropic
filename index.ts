@@ -158,6 +158,7 @@ function getConfig() {
 	return {
 		project: process.env.VERTEX_PROJECT_ID || persisted.project || "your-gcp-project-id",
 		region: process.env.VERTEX_REGION || persisted.region || "us-east5",
+		account: process.env.VERTEX_ACCOUNT || persisted.account || undefined,
 		get gcloudPath() {
 			return process.env.VERTEX_GCLOUD_PATH || findGcloud();
 		},
@@ -181,10 +182,13 @@ export class GcpAuthClient {
 		url: string | URL | globalThis.Request,
 		init: RequestInit,
 		gcloudPath: string,
+		account?: string,
 		options?: FetchWithRetryOptions,
 	): Promise<Response> {
 		if (!this.tokenCache || Date.now() > this.tokenCache.expiresAt) {
-			const stdout = await this.executor.execute(gcloudPath, ["auth", "print-access-token"]);
+			const args = ["auth", "print-access-token"];
+			if (account) args.push(`--account=${account}`);
+			const stdout = await this.executor.execute(gcloudPath, args);
 			this.tokenCache = {
 				token: stdout.trim(),
 				expiresAt: Date.now() + 50 * 60 * 1000,
@@ -198,7 +202,9 @@ export class GcpAuthClient {
 		
 		if (response.status === 401) {
 			this.tokenCache = null;
-			const stdout = await this.executor.execute(gcloudPath, ["auth", "print-access-token"]);
+			const args = ["auth", "print-access-token"];
+			if (account) args.push(`--account=${account}`);
+			const stdout = await this.executor.execute(gcloudPath, args);
 			this.tokenCache = {
 				token: stdout.trim(),
 				expiresAt: Date.now() + 50 * 60 * 1000,
@@ -863,6 +869,7 @@ function streamVertexAnthropic(
 			const config = getConfig();
 			const project = (model as { project?: string }).project || config.project;
 			const region = (model as { region?: string }).region || config.region;
+			const account = (model as { account?: string }).account || config.account;
 			const gcloudPath = (model as { gcloudPath?: string }).gcloudPath || config.gcloudPath;
 
 			// Build Anthropic Messages API request body
@@ -950,6 +957,7 @@ function streamVertexAnthropic(
 					body: JSON.stringify(body),
 				},
 				gcloudPath,
+				account,
 				{
 					maxRetries: 3,
 					signal: options?.signal,
@@ -1137,9 +1145,26 @@ function checkGcloudInstalled(gcloudPath: string): boolean {
 	}
 }
 
-function checkGcloudAuthenticated(gcloudPath: string): boolean {
+function listAccounts(gcloudPath: string): string[] {
 	try {
-		const token = execFileSync(gcloudPath, ["auth", "print-access-token"], {
+		return execFileSync(gcloudPath, ["auth", "list", "--format=value(account)"], {
+			encoding: "utf-8",
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: 10000,
+		})
+			.trim()
+			.split("\n")
+			.filter((p) => p && p !== "(unset)");
+	} catch {
+		return [];
+	}
+}
+
+function checkGcloudAuthenticated(gcloudPath: string, account?: string): boolean {
+	try {
+		const args = ["auth", "print-access-token"];
+		if (account) args.push(`--account=${account}`);
+		const token = execFileSync(gcloudPath, args, {
 			encoding: "utf-8",
 			timeout: 5000,
 			stdio: ["ignore", "pipe", "ignore"],
@@ -1150,9 +1175,11 @@ function checkGcloudAuthenticated(gcloudPath: string): boolean {
 	}
 }
 
-function getCurrentProject(gcloudPath: string): string | null {
+function getCurrentProject(gcloudPath: string, account?: string): string | null {
 	try {
-		const project = execFileSync(gcloudPath, ["config", "get-value", "project"], {
+		const args = ["config", "get-value", "project"];
+		if (account) args.push(`--account=${account}`);
+		const project = execFileSync(gcloudPath, args, {
 			encoding: "utf-8",
 			stdio: ["ignore", "pipe", "ignore"],
 		}).trim();
@@ -1229,9 +1256,30 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 
+				// Step 1b: Select account
+				callbacks.onAuth({ type: "progress", message: "Configuring GCP account..." });
+				let account = process.env.VERTEX_ACCOUNT;
+
+				if (!account) {
+					const accounts = listAccounts(gcloudPath);
+					if (accounts.length > 0) {
+						let accountPrompt = `Available accounts:\n${accounts.map((a, i) => `  ${i + 1}. ${a}`).join("\n")}\n\nEnter number or full account email (leave blank to use default):`;
+						const accountInput = await callbacks.onPrompt({ message: accountPrompt });
+						
+						if (accountInput && accountInput.trim() !== "") {
+							const idx = parseInt(accountInput.trim(), 10);
+							if (!isNaN(idx) && idx >= 1 && idx <= accounts.length) {
+								account = accounts[idx - 1];
+							} else {
+								account = accountInput.trim();
+							}
+						}
+					}
+				}
+
 				// Step 2: Check authentication
 				callbacks.onAuth({ type: "progress", message: "Checking gcloud authentication..." });
-				if (!checkGcloudAuthenticated(gcloudPath)) {
+				if (!checkGcloudAuthenticated(gcloudPath, account)) {
 					const doAuth = await callbacks.onPrompt({
 						message: "Not authenticated with gcloud. Run 'gcloud auth login' now? (y/n)",
 					});
@@ -1242,6 +1290,12 @@ export default function (pi: ExtensionAPI) {
 
 						try {
 							execFileSync(gcloudPath, ["auth", "login"], { stdio: "inherit" });
+							
+							// If they didn't have an account set, grab the one they just logged into
+							if (!account) {
+								const newAccounts = listAccounts(gcloudPath);
+								if (newAccounts.length > 0) account = newAccounts[0]; // best effort
+							}
 						} catch {
 							throw new Error("Authentication failed. Please try: gcloud auth login");
 						}
@@ -1255,7 +1309,7 @@ export default function (pi: ExtensionAPI) {
 				let project = process.env.VERTEX_PROJECT_ID;
 
 				if (!project || project === "your-gcp-project-id") {
-					const currentProject = getCurrentProject(gcloudPath);
+					const currentProject = getCurrentProject(gcloudPath, account);
 					if (currentProject) {
 						const use = await callbacks.onPrompt({
 							message: `Use current project '${currentProject}'? (y/n)`,
@@ -1359,7 +1413,8 @@ export default function (pi: ExtensionAPI) {
 					message:
 						`✓ Configured successfully!\n\n` +
 						`Project: ${project}\n` +
-						`Region: ${region}\n\n` +
+						`Region: ${region}\n` +
+						(account ? `Account: ${account}\n\n` : `\n`) +
 						`Settings persisted to ~/.pi/agent/auth.json.\n` +
 						`If authentication fails later, run: gcloud auth login`,
 				});
@@ -1370,6 +1425,7 @@ export default function (pi: ExtensionAPI) {
 					expires: Date.now() + 1000 * 60 * 60 * 24 * 365,
 					project,
 					region,
+					account,
 				};
 			},
 
