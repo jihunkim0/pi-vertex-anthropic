@@ -866,7 +866,7 @@ function streamVertexAnthropic(
 			// Handle thinking/reasoning
 			if (options?.reasoning && model.reasoning) {
 				// Adaptive thinking is supported on Claude 4.6+ models
-				const isAdaptiveSupported = model.id.includes("-4-6");
+				const isAdaptiveSupported = model.id.includes("-4-6") || model.id.includes("-4-7");
 
 				const customBudget = options.thinkingBudgets?.[options.reasoning as keyof typeof options.thinkingBudgets];
 
@@ -1380,6 +1380,15 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		models: [
+			{
+				id: "claude-opus-4-7",
+				name: "Claude Opus 4.7 (Vertex)",
+				reasoning: true,
+				input: ["text", "image"],
+				cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+				contextWindow: 1000000,
+				maxTokens: 128000,
+			},
 			{
 				id: "claude-opus-4-6",
 				name: "Claude Opus 4.6 (Vertex)",

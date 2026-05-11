@@ -93,7 +93,14 @@ Once installed and configured, the extension will register the `vertex-anthropic
 
 All Claude models available on Vertex AI are supported:
 
-#### Claude 4.6 & 4.5 Generation (Extended Thinking)
+#### Claude 4.7, 4.6 & 4.5 Generation (Extended Thinking)
+
+- **Claude Opus 4.7** (`claude-opus-4-7`)
+  - 1M context, 128K max output
+  - ✅ Extended thinking/reasoning
+  - ✅ Image support
+  - Cost: $5/1M input, $25/1M output
+  - **Latest Flagship** - Most intelligent model
 
 - **Claude Opus 4.6** (`claude-opus-4-6`)
   - 1M context, 64K max output
@@ -319,6 +326,8 @@ The `/login` command lets you choose your preferred region.
 
 | Model | Direct Anthropic API | Vertex AI |
 |-------|---------------------|-----------|
+| Claude Opus 4.7 Input | $5/1M tokens | $5/1M tokens |
+| Claude Opus 4.7 Output | $25/1M tokens | $25/1M tokens |
 | Claude Opus 4.6 Input | $5/1M tokens | $5/1M tokens |
 | Claude Opus 4.6 Output | $25/1M tokens | $25/1M tokens |
 | Claude Sonnet 4.6 Input | $3/1M tokens | $3/1M tokens |
