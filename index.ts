@@ -168,32 +168,59 @@ function getConfig() {
 // Token Caching (async, non-blocking)
 // =============================================================================
 
-let tokenCache: { token: string; expiresAt: number } | null = null;
-
-/** Get a gcloud access token, using cache when possible. Non-blocking. */
-async function getAccessToken(gcloudPath: string): Promise<string> {
-	if (tokenCache && Date.now() < tokenCache.expiresAt) {
-		return tokenCache.token;
-	}
-
-	const { stdout } = await execFileAsync(gcloudPath, ["auth", "print-access-token"], {
-		timeout: 10000,
-	});
-	const token = stdout.trim();
-
-	if (!token || token.length < 20) {
-		throw new Error("Invalid access token from gcloud. Run: gcloud auth login");
-	}
-
-	// gcloud tokens last ~60 min; cache for 50 min to avoid edge-case expiry
-	tokenCache = { token, expiresAt: Date.now() + 50 * 60 * 1000 };
-	return token;
+export interface CommandExecutor {
+	execute(command: string, args: string[]): Promise<string>;
 }
 
-/** Invalidate the cached token (e.g., on 401). */
-function invalidateTokenCache(): void {
-	tokenCache = null;
+export class GcpAuthClient {
+	private tokenCache: { token: string; expiresAt: number } | null = null;
+
+	constructor(private executor: CommandExecutor) {}
+
+	async fetchWithAuth(
+		url: string | URL | globalThis.Request,
+		init: RequestInit,
+		gcloudPath: string,
+		options?: FetchWithRetryOptions,
+	): Promise<Response> {
+		if (!this.tokenCache || Date.now() > this.tokenCache.expiresAt) {
+			const stdout = await this.executor.execute(gcloudPath, ["auth", "print-access-token"]);
+			this.tokenCache = {
+				token: stdout.trim(),
+				expiresAt: Date.now() + 50 * 60 * 1000,
+			};
+		}
+		
+		const headers = new Headers(init.headers);
+		headers.set("Authorization", `Bearer ${this.tokenCache.token}`);
+		
+		const response = await fetchWithRetry(url as string, { ...init, headers }, options);
+		
+		if (response.status === 401) {
+			this.tokenCache = null;
+			const stdout = await this.executor.execute(gcloudPath, ["auth", "print-access-token"]);
+			this.tokenCache = {
+				token: stdout.trim(),
+				expiresAt: Date.now() + 50 * 60 * 1000,
+			};
+			headers.set("Authorization", `Bearer ${this.tokenCache.token}`);
+			return fetchWithRetry(url as string, { ...init, headers }, options);
+		}
+		
+		return response;
+	}
 }
+
+const defaultExecutor: CommandExecutor = {
+	execute: async (command: string, args: string[]) => {
+		const { stdout } = await execFileAsync(command, args);
+		return stdout;
+	}
+};
+
+export const gcpAuthClient = new GcpAuthClient(defaultExecutor);
+
+
 
 // =============================================================================
 // Message Transformation (handles incomplete tool calls)
@@ -838,9 +865,6 @@ function streamVertexAnthropic(
 			const region = (model as { region?: string }).region || config.region;
 			const gcloudPath = (model as { gcloudPath?: string }).gcloudPath || config.gcloudPath;
 
-			// Get access token (async, cached)
-			let token = await getAccessToken(gcloudPath);
-
 			// Build Anthropic Messages API request body
 			const body: Record<string, unknown> = {
 				anthropic_version: "vertex-2023-10-16",
@@ -915,32 +939,26 @@ function streamVertexAnthropic(
 
 			const url = `https://${endpoint}/v1/projects/${project}/locations/${region}/publishers/anthropic/models/${vertexModelId}:streamRawPredict`;
 
-			// Make request with retry logic
-			const response = await fetchWithRetry(
+			// Make request with auth and retry logic
+			const response = await gcpAuthClient.fetchWithAuth(
 				url,
 				{
 					method: "POST",
 					headers: {
-						Authorization: `Bearer ${token}`,
 						"Content-Type": "application/json",
 					},
 					body: JSON.stringify(body),
 				},
+				gcloudPath,
 				{
 					maxRetries: 3,
 					signal: options?.signal,
 					onRetry: (attempt, status, delay) => {
-						// On 401, invalidate token cache so next retry gets a fresh token
-						if (status === 401) {
-							invalidateTokenCache();
-							// Re-fetch token synchronously for the retry
-							// (the retry loop will use the new token via the Authorization header)
-						}
 						console.error(
-							`[vertex-anthropic] Retry ${attempt}: status=${status}, delay=${Math.round(delay)}ms`,
+							`[vertex-anthropic] Stream request failed (HTTP ${status}). Retrying in ${delay}ms... (Attempt ${attempt}/3)`,
 						);
 					},
-				},
+				}
 			);
 
 			if (!response.ok) {
@@ -1390,6 +1408,15 @@ export default function (pi: ExtensionAPI) {
 				maxTokens: 128000,
 			},
 			{
+				id: "claude-opus-4-7",
+				name: "Claude Opus 4.7 (Vertex)",
+				reasoning: true,
+				input: ["text", "image"],
+				cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+				contextWindow: 1000000,
+				maxTokens: 128000,
+			},
+			{
 				id: "claude-opus-4-6",
 				name: "Claude Opus 4.6 (Vertex)",
 				reasoning: true,
@@ -1516,7 +1543,6 @@ export const __test__ = {
 	normalizeToolCallId,
 	parseSSE,
 	fetchWithRetry,
-	getAccessToken,
-	invalidateTokenCache,
+	GcpAuthClient,
 	mapStopReason,
 };
