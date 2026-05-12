@@ -910,8 +910,7 @@ function streamVertexAnthropic(
 				if (isAdaptiveSupported) {
 					// Use the modern adaptive thinking API for 4.6 and 4.7
 					let effort = "high";
-					if (options.reasoning === "xhigh") effort = "max";
-					else if (options.reasoning === "high") effort = "high";
+					if (options.reasoning === "xhigh" || options.reasoning === "high") effort = "max";
 					else if (options.reasoning === "medium") effort = "medium";
 					else if (options.reasoning === "low" || options.reasoning === "minimal") effort = "low";
 
