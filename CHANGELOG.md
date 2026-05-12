@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Fixed bug where `getPersistedCredentials` failed to read the `account` property from `auth.json`, causing the extension to silently fall back to the default `gcloud` account even when a specific account was selected via `/login`.
 - Fixed Google Cloud 403 `PERMISSION_DENIED` errors when using a non-default account by properly attaching the `X-Goog-User-Project` header mapped to the configured project.
+- Fixed duplicate `claude-opus-4-7` model entry in the model configuration list.
+- Migrated Claude 4.6 and 4.7 models to Anthropic's new `adaptive` thinking API (manual `budget_tokens` returns a 400 error on Opus 4.7).
+- Mapped the Pi `high` effort level string to `max` effort internally for adaptive thinking, to maximize reasoning depth from Pi's built-in UI.
 
 ## [2.4.0] - 2026-05-11
 
