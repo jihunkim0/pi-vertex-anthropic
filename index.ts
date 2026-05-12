@@ -902,9 +902,42 @@ function streamVertexAnthropic(
 
 				const customBudget = options.thinkingBudgets?.[options.reasoning as keyof typeof options.thinkingBudgets];
 
-				// Provide plenty of max_tokens for xhigh
+				// Provide plenty of max_tokens for xhigh/max effort
 				if (options.reasoning === "xhigh") {
-					body.max_tokens = Math.max(body.max_tokens as number, 64000);
+					body.max_tokens = Math.max(body.max_tokens as number, 128000);
+				}
+
+				if (isAdaptiveSupported) {
+					// Use the modern adaptive thinking API for 4.6 and 4.7
+					let effort = "high";
+					if (options.reasoning === "xhigh") effort = "max";
+					else if (options.reasoning === "high") effort = "high";
+					else if (options.reasoning === "medium") effort = "medium";
+					else if (options.reasoning === "low" || options.reasoning === "minimal") effort = "low";
+
+					body.thinking = { type: "adaptive" };
+					(body as any).output_config = { effort };
+					
+					// Ensure max_tokens has enough headroom for max effort
+					if (effort === "max") {
+						body.max_tokens = Math.max(body.max_tokens as number, 64000);
+					}
+				} else if (customBudget) {
+					// Legacy models with custom budget
+					body.thinking = { type: "enabled", budget_tokens: customBudget };
+					body.max_tokens = Math.max(body.max_tokens as number, customBudget + 1024);
+				} else {
+					// Legacy fallback for older models
+					const defaultBudgets: Record<string, number> = {
+						minimal: 1024,
+						low: 4096,
+						medium: 10240,
+						high: 20480,
+						xhigh: 40000,
+					};
+					const budget = defaultBudgets[options.reasoning] ?? 10240;
+					body.thinking = { type: "enabled", budget_tokens: budget };
+					body.max_tokens = Math.max(body.max_tokens as number, budget + 1024);
 				}
 
 				if (customBudget) {
@@ -1456,15 +1489,6 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		models: [
-			{
-				id: "claude-opus-4-7",
-				name: "Claude Opus 4.7 (Vertex)",
-				reasoning: true,
-				input: ["text", "image"],
-				cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-				contextWindow: 1000000,
-				maxTokens: 128000,
-			},
 			{
 				id: "claude-opus-4-7",
 				name: "Claude Opus 4.7 (Vertex)",
