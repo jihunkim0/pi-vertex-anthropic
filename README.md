@@ -35,14 +35,14 @@ A [Pi coding agent](https://github.com/badlogic/pi) extension that enables Claud
 **One-line install:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/skyfallsin/pi-vertex-anthropic/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jihunkim0/pi-vertex-anthropic/main/install.sh | bash
 ```
 
 **Manual install:**
 
 ```bash
 mkdir -p ~/.pi/agent/extensions/vertex-anthropic
-git clone https://github.com/skyfallsin/pi-vertex-anthropic.git ~/.pi/agent/extensions/vertex-anthropic
+git clone https://github.com/jihunkim0/pi-vertex-anthropic.git ~/.pi/agent/extensions/vertex-anthropic
 cd ~/.pi/agent/extensions/vertex-anthropic && npm install
 ```
 
@@ -251,6 +251,16 @@ npm install
 
 ## Troubleshooting
 
+### Verify Authentication Mapping
+
+If you encounter `403 PERMISSION_DENIED` errors when using non-default `gcloud` accounts, you can use the built-in verification script to debug authentication and `X-Goog-User-Project` header mapping:
+
+```bash
+npm run verify-auth
+```
+
+This simulates a raw API request matching the exact configuration the extension uses.
+
 ### "No GCP project configured"
 
 Set the environment variable:
@@ -369,9 +379,9 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Support
 
-- 🐛 [Report Issues](https://github.com/skyfallsin/pi-vertex-anthropic/issues)
-- 💬 [Discussions](https://github.com/skyfallsin/pi-vertex-anthropic/discussions)
-- 📧 Contact: [via GitHub](https://github.com/skyfallsin)
+- 🐛 [Report Issues](https://github.com/jihunkim0/pi-vertex-anthropic/issues)
+- 💬 [Discussions](https://github.com/jihunkim0/pi-vertex-anthropic/discussions)
+- 📧 Contact: [via GitHub](https://github.com/jihunkim0)
 
 ---
 

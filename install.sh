@@ -11,7 +11,7 @@
 set -e
 
 EXTENSION_DIR="$HOME/.pi/agent/extensions/vertex-anthropic"
-REPO_URL="https://github.com/skyfallsin/pi-vertex-anthropic.git"
+REPO_URL="https://github.com/jihunkim0/pi-vertex-anthropic.git"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEV_MODE=false
 
@@ -90,5 +90,5 @@ echo "   1. Restart Pi or run /reload"
 echo "   2. Run /login to configure your GCP project and region"
 echo "   3. Ensure you're authenticated: gcloud auth login"
 echo ""
-echo "📖 Documentation: https://github.com/skyfallsin/pi-vertex-anthropic"
+echo "📖 Documentation: https://github.com/jihunkim0/pi-vertex-anthropic"
 echo ""

@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1] - 2026-05-12
+### Fixed
+- Fixed bug where `getPersistedCredentials` failed to read the `account` property from `auth.json`, causing the extension to silently fall back to the default `gcloud` account even when a specific account was selected via `/login`.
+- Fixed Google Cloud 403 `PERMISSION_DENIED` errors when using a non-default account by properly attaching the `X-Goog-User-Project` header mapped to the configured project.
+
 ## [2.4.0] - 2026-05-11
 
 ### Added
