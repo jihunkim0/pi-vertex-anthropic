@@ -953,6 +953,7 @@ function streamVertexAnthropic(
 					method: "POST",
 					headers: {
 						"Content-Type": "application/json",
+						"X-Goog-User-Project": project,
 					},
 					body: JSON.stringify(body),
 				},
