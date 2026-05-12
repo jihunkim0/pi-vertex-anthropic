@@ -113,7 +113,7 @@ function validateRegion(region: string): string {
  * 3. Hardcoded defaults (fallback)
  */
 
-function getPersistedCredentials(): { project?: string; region?: string } {
+function getPersistedCredentials(): { project?: string; region?: string; account?: string } {
 	try {
 		const authPath = `${process.env.HOME}/.pi/agent/auth.json`;
 		const data = JSON.parse(readFileSync(authPath, "utf-8"));
@@ -122,6 +122,7 @@ function getPersistedCredentials(): { project?: string; region?: string } {
 			return {
 				project: cred.project,
 				region: cred.region,
+				account: cred.account,
 			};
 		}
 	} catch {}
